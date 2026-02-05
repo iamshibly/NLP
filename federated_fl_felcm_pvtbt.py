@@ -113,8 +113,8 @@ CFG = {
     "ga_elites": 3,
     "elite_pool_max": 15,
 
-    # augmentation (DISABLED)
-    "use_augmentation": False,
+    # augmentation
+    "use_augmentation": True,
 
     # model adapter/head
     "adapter_dim": 256,
@@ -579,10 +579,10 @@ print_table(dist_df, "Client class distribution (Non-IID, per dataset)")
 add_table_to_csv(dist_df, "client_distribution")
 
 # ============================================================
-# 4) Data pipeline (NO AUGMENTATION) + ImageNet Norm
+# 4) Data pipeline (AUGMENTATION) + ImageNet Norm
 # ============================================================
 print("\n" + "=" * 92)
-print("STEP 4: DATA LOADERS (NO AUGMENTATION) + IMAGENET NORM")
+print("STEP 4: DATA LOADERS (AUGMENTATION) + IMAGENET NORM")
 print("=" * 92)
 
 
@@ -593,14 +593,27 @@ def load_rgb(path):
         return Image.new("RGB", (CFG["img_size"], CFG["img_size"]), (128, 128, 128))
 
 
-# NO augmentation: train_tfms == eval_tfms
+# Evaluation transforms
 EVAL_TFMS = transforms.Compose(
     [
         transforms.Resize((CFG["img_size"], CFG["img_size"])),
         transforms.ToTensor(),
     ]
 )
-TRAIN_TFMS = EVAL_TFMS
+
+# Training transforms (augmentation ON)
+if CFG["use_augmentation"]:
+    TRAIN_TFMS = transforms.Compose(
+        [
+            transforms.Resize((CFG["img_size"], CFG["img_size"])),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=15),
+            transforms.ColorJitter(brightness=0.15, contrast=0.15),
+            transforms.ToTensor(),
+        ]
+    )
+else:
+    TRAIN_TFMS = EVAL_TFMS
 
 
 class MRIDataset(Dataset):
@@ -685,7 +698,7 @@ for i, (ds_name, local_id, test_idx) in enumerate(client_test_splits):
     t_loader = make_loader(df_src, test_idx, CFG["batch_size"], EVAL_TFMS, shuffle=False)
     client_test_loaders.append((ds_name, local_id, t_loader))
 
-print("Augmentation: OFF ✅ (train transforms == eval transforms)")
+print(f"Augmentation: {'ON ✅' if CFG['use_augmentation'] else 'OFF ✅ (train transforms == eval transforms)'}")
 
 # ============================================================
 # 5) Enhanced FELCM + theta fullforms
