@@ -107,15 +107,15 @@ CFG = {
     "dirichlet_alpha": 0.35,
 
     # GA / preprocessing
-    "use_preprocessing": False,
-    "use_ga": False,
+    "use_preprocessing": True,
+    "use_ga": True,
     "ga_pop": 10,
     "ga_gens": 5,
     "ga_elites": 3,
     "elite_pool_max": 15,
 
     # augmentation
-    "use_augmentation": True,
+    "use_augmentation": False,
 
     # model adapter/head
     "adapter_dim": 256,
@@ -580,10 +580,10 @@ print_table(dist_df, "Client class distribution (Non-IID, per dataset)")
 add_table_to_csv(dist_df, "client_distribution")
 
 # ============================================================
-# 4) Data pipeline (AUGMENTATION) + ImageNet Norm
+# 4) Data pipeline (NO AUGMENTATION) + ImageNet Norm
 # ============================================================
 print("\n" + "=" * 92)
-print("STEP 4: DATA LOADERS (AUGMENTATION) + IMAGENET NORM")
+print("STEP 4: DATA LOADERS (NO AUGMENTATION) + IMAGENET NORM")
 print("=" * 92)
 
 
@@ -618,10 +618,12 @@ else:
 
 
 class MRIDataset(Dataset):
-    def __init__(self, frame, indices=None, tfms=None):
+    def __init__(self, frame, indices=None, tfms=None, source_id=0, client_id=0):
         self.df = frame
         self.indices = indices if indices is not None else list(range(len(frame)))
         self.tfms = tfms
+        self.source_id = int(source_id)
+        self.client_id = int(client_id)
 
     def __len__(self):
         return len(self.indices)
@@ -632,7 +634,7 @@ class MRIDataset(Dataset):
         img = load_rgb(row["path"])
         x = self.tfms(img) if self.tfms is not None else transforms.ToTensor()(img)
         y = int(row["y"])
-        return x, y, row["path"]
+        return x, y, row["path"], self.source_id, self.client_id
 
 
 def make_weighted_sampler(frame, indices, num_classes):
@@ -649,8 +651,8 @@ def make_weighted_sampler(frame, indices, num_classes):
     )
 
 
-def make_loader(frame, indices, bs, tfms, shuffle=False, sampler=None):
-    ds = MRIDataset(frame, indices=indices, tfms=tfms)
+def make_loader(frame, indices, bs, tfms, shuffle=False, sampler=None, source_id=0, client_id=0):
+    ds = MRIDataset(frame, indices=indices, tfms=tfms, source_id=source_id, client_id=client_id)
     return DataLoader(
         ds,
         batch_size=bs,
@@ -667,6 +669,7 @@ def make_loader(frame, indices, bs, tfms, shuffle=False, sampler=None):
 client_loaders = []
 for idx, (ds_name, local_id, tr_idx, tune_idx, val_idx) in enumerate(client_splits):
     df_src = train1 if ds_name == "ds1" else train2
+    source_id = 0 if ds_name == "ds1" else 1
     sampler = make_weighted_sampler(df_src, tr_idx, NUM_CLASSES)
     tr_loader = make_loader(
         df_src,
@@ -675,6 +678,8 @@ for idx, (ds_name, local_id, tr_idx, tune_idx, val_idx) in enumerate(client_spli
         TRAIN_TFMS,
         shuffle=(sampler is None),
         sampler=sampler,
+        source_id=source_id,
+        client_id=idx,
     )
     tune_loader = make_loader(
         df_src,
@@ -682,6 +687,8 @@ for idx, (ds_name, local_id, tr_idx, tune_idx, val_idx) in enumerate(client_spli
         CFG["batch_size"],
         EVAL_TFMS,
         shuffle=True,
+        source_id=source_id,
+        client_id=idx,
     )
     val_loader = make_loader(
         df_src,
@@ -689,6 +696,8 @@ for idx, (ds_name, local_id, tr_idx, tune_idx, val_idx) in enumerate(client_spli
         CFG["batch_size"],
         EVAL_TFMS,
         shuffle=False,
+        source_id=source_id,
+        client_id=idx,
     )
     client_loaders.append((tr_loader, tune_loader, val_loader))
 
@@ -696,7 +705,17 @@ for idx, (ds_name, local_id, tr_idx, tune_idx, val_idx) in enumerate(client_spli
 client_test_loaders = []
 for i, (ds_name, local_id, test_idx) in enumerate(client_test_splits):
     df_src = test1 if ds_name == "ds1" else test2
-    t_loader = make_loader(df_src, test_idx, CFG["batch_size"], EVAL_TFMS, shuffle=False)
+    source_id = 0 if ds_name == "ds1" else 1
+    client_id = local_id if ds_name == "ds1" else local_id + 2
+    t_loader = make_loader(
+        df_src,
+        test_idx,
+        CFG["batch_size"],
+        EVAL_TFMS,
+        shuffle=False,
+        source_id=source_id,
+        client_id=client_id,
+    )
     client_test_loaders.append((ds_name, local_id, t_loader))
 
 print(f"Augmentation: {'ON ✅' if CFG['use_augmentation'] else 'OFF ✅ (train transforms == eval transforms)'}")
@@ -716,8 +735,8 @@ if CFG["use_augmentation"]:
 
         raws, augs = [], []
         for i in range(sample_n):
-            x_raw, _, _ = raw_ds[i]
-            x_aug, _, _ = aug_ds[i]
+            x_raw, _, _, _, _ = raw_ds[i]
+            x_aug, _, _, _, _ = aug_ds[i]
             raws.append(x_raw)
             augs.append(x_aug)
 
@@ -906,8 +925,8 @@ class TokenAttentionPooling(nn.Module):
         return (x * attn.unsqueeze(-1)).sum(dim=1)
 
 
-class MultiScaleFusionHead(nn.Module):
-    def __init__(self, in_channels: List[int], out_dim: int, num_classes: int, dropout=0.3):
+class MultiScaleFeatureFuser(nn.Module):
+    def __init__(self, in_channels: List[int], out_dim: int):
         super().__init__()
         self.out_dim = out_dim
         self.proj = nn.ModuleList([
@@ -924,15 +943,6 @@ class MultiScaleFusionHead(nn.Module):
             nn.GELU(),
         )
         self.pool = TokenAttentionPooling(out_dim)
-        self.adapter = MultiHeadAttentionAdapter(out_dim, num_heads=4, bottleneck=out_dim, dropout=0.1)
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(out_dim),
-            nn.Dropout(dropout),
-            nn.Linear(out_dim, max(64, out_dim // 2)),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(max(64, out_dim // 2), num_classes),
-        )
 
     def forward(self, feats):
         # feats: list of feature maps [B, C, H, W]
@@ -945,12 +955,38 @@ class MultiScaleFusionHead(nn.Module):
         B, C, H, W = x.shape
         tokens = x.flatten(2).transpose(1, 2)  # [B, HW, C]
         pooled = self.pool(tokens)
-        pooled = self.adapter(pooled)
-        return self.classifier(pooled)
+        return pooled
+
+
+class EnhancedBrainTuner(nn.Module):
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        self.mha = MultiHeadAttentionAdapter(dim, num_heads=4, bottleneck=dim, dropout=dropout)
+        self.se = nn.Sequential(
+            nn.Linear(dim, max(8, dim // 4)),
+            nn.ReLU(inplace=True),
+            nn.Linear(max(8, dim // 4), dim),
+            nn.Sigmoid(),
+        )
+        self.refine = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim),
+        )
+        self.gate = nn.Parameter(torch.ones(3) / 3)
+
+    def forward(self, x):
+        gate = F.softmax(self.gate, dim=0)
+        out1 = self.mha(x)
+        out2 = x * self.se(x)
+        out3 = x + 0.2 * self.refine(x)
+        return gate[0] * out1 + gate[1] * out2 + gate[2] * out3
 
 
 class PVTv2B2_MultiScale(nn.Module):
-    def __init__(self, num_classes, pretrained=True, head_dropout=0.3):
+    def __init__(self, num_classes, pretrained=True, head_dropout=0.3, cond_dim=128, num_clients=4):
         super().__init__()
         self.backbone = timm.create_model(
             BACKBONE_NAME,
@@ -960,17 +996,70 @@ class PVTv2B2_MultiScale(nn.Module):
         )
         in_channels = self.backbone.feature_info.channels()
         out_dim = max(256, in_channels[-1] // 2)
-        self.head = MultiScaleFusionHead(in_channels, out_dim, num_classes, dropout=head_dropout)
+        self.fuser = MultiScaleFeatureFuser(in_channels, out_dim)
+        self.tuner = EnhancedBrainTuner(out_dim, dropout=0.1)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(out_dim),
+            nn.Dropout(head_dropout),
+            nn.Linear(out_dim, max(64, out_dim // 2)),
+            nn.GELU(),
+            nn.Dropout(head_dropout * 0.5),
+            nn.Linear(max(64, out_dim // 2), num_classes),
+        )
+        self.theta_mlp = nn.Sequential(
+            nn.Linear(7, cond_dim),
+            nn.GELU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
+        self.source_emb = nn.Embedding(2, cond_dim)
+        self.client_emb = nn.Embedding(num_clients, cond_dim)
+        self.cond_norm = nn.LayerNorm(cond_dim)
+        self.gate_early = nn.Linear(cond_dim, 3)
+        self.gate_mid = nn.Linear(cond_dim, out_dim)
+        self.gate_late = nn.Linear(cond_dim, out_dim)
         self._init_weights()
 
     def _init_weights(self):
-        for p in self.head.parameters():
+        for p in list(self.fuser.parameters()) + list(self.tuner.parameters()) + list(self.classifier.parameters()):
+            if p.dim() > 1:
+                nn.init.trunc_normal_(p, std=0.02)
+        for p in list(self.theta_mlp.parameters()) + list(self.source_emb.parameters()) + list(self.client_emb.parameters()):
             if p.dim() > 1:
                 nn.init.trunc_normal_(p, std=0.02)
 
-    def forward(self, x):
-        feats = self.backbone(x)
-        return self.head(feats)
+    def _cond_vec(self, theta_vec, source_id, client_id):
+        cond = self.theta_mlp(theta_vec)
+        cond = cond + self.source_emb(source_id) + self.client_emb(client_id)
+        return self.cond_norm(cond)
+
+    def forward(self, x_raw_n, x_fel_n, theta_vec, source_id, client_id, return_gates=False):
+        cond = self._cond_vec(theta_vec, source_id, client_id)
+
+        g0 = torch.sigmoid(self.gate_early(cond)).view(-1, 3, 1, 1)
+        x0 = (1 - g0) * x_raw_n + g0 * x_fel_n
+
+        feats0 = self.backbone(x0)
+        feats1 = self.backbone(x_fel_n)
+        f0 = self.fuser(feats0)
+        f1 = self.fuser(feats1)
+
+        g1 = torch.sigmoid(self.gate_mid(cond))
+        f_mid = (1 - g1) * f0 + g1 * f1
+
+        t0 = self.tuner(f0)
+        t1 = self.tuner(f1)
+        t_mid = self.tuner(f_mid)
+
+        t_views = 0.5 * (t0 + t1)
+        g2 = torch.sigmoid(self.gate_late(cond))
+        t_final = (1 - g2) * t_mid + g2 * t_views
+
+        logits = self.classifier(t_final)
+
+        if return_gates:
+            gates = {"g0": g0, "g1": g1, "g2": g2}
+            return logits, gates
+        return logits
 
 
 def count_params(model):
@@ -1091,7 +1180,7 @@ def ga_fitness(theta, backbone_frozen, batch_x, batch_y, use_separability=True):
 def _safe_first_batch(dl):
     try:
         it = iter(dl)
-        bx, by, _ = next(it)
+        bx, by, _, _, _ = next(it)
         return bx, by
     except Exception:
         return None, None
@@ -1149,6 +1238,56 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def preproc_theta_vec(preproc_module, batch_size):
+    if hasattr(preproc_module, "gamma"):
+        theta = torch.tensor(
+            [
+                preproc_module.gamma,
+                preproc_module.alpha,
+                preproc_module.beta,
+                preproc_module.tau,
+                float(preproc_module.blur_k) / 7.0,
+                preproc_module.sharpen,
+                preproc_module.denoise,
+            ],
+            device=DEVICE,
+            dtype=torch.float32,
+        )
+    else:
+        theta = torch.zeros(7, device=DEVICE, dtype=torch.float32)
+    return theta.unsqueeze(0).repeat(batch_size, 1)
+
+
+def gate_entropy(gate):
+    eps = 1e-6
+    p = gate.clamp(eps, 1 - eps)
+    ent = -(p * torch.log2(p) + (1 - p) * torch.log2(1 - p))
+    return ent
+
+
+def summarize_gate_stats(gate_stats, num_classes):
+    gate_metrics = {}
+    all_gates = {"g0": [], "g1": [], "g2": []}
+    all_labels = []
+    for gates, y_cpu in gate_stats:
+        for k in all_gates:
+            all_gates[k].append(gates[k].detach().cpu())
+        all_labels.append(y_cpu)
+
+    labels = torch.cat(all_labels, dim=0)
+    for k in all_gates:
+        g = torch.cat(all_gates[k], dim=0)
+        ent = gate_entropy(g).mean(dim=list(range(1, g.ndim)))
+        gate_metrics[f"{k}_mean"] = float(g.mean().item())
+        gate_metrics[f"{k}_entropy_mean"] = float(ent.mean().item())
+
+        for c in range(num_classes):
+            mask = labels == c
+            if mask.any():
+                gate_metrics[f"{k}_mean_c{c}"] = float(g[mask].mean().item())
+                gate_metrics[f"{k}_entropy_c{c}"] = float(ent[mask].mean().item())
+    return gate_metrics
+
 @torch.no_grad()
 def _auc_metrics(y_true, p_pred, num_classes):
     out = {}
@@ -1167,22 +1306,33 @@ def _auc_metrics(y_true, p_pred, num_classes):
 
 
 @torch.no_grad()
-def evaluate_full(model, loader, preproc_module):
+def evaluate_full(model, loader, preproc_module, return_gates=False):
     t0 = time.time()
     model.eval()
     preproc_module.eval()
 
     all_y, all_p, all_loss = [], [], []
+    gate_stats = []
     has_any = False
 
-    for x, y, _ in loader:
+    for x, y, _, source_id, client_id in loader:
         has_any = True
         x = x.to(DEVICE, non_blocking=True)
         y = y.to(DEVICE, non_blocking=True)
+        source_id = source_id.to(DEVICE, non_blocking=True)
+        client_id = client_id.to(DEVICE, non_blocking=True)
 
         x_p = preproc_module(x)
-        x_n = (x_p - IMAGENET_MEAN) / IMAGENET_STD
-        logits = model(x_n)
+        x_raw_n = (x - IMAGENET_MEAN) / IMAGENET_STD
+        x_fel_n = (x_p - IMAGENET_MEAN) / IMAGENET_STD
+
+        if return_gates:
+            theta_vec = preproc_theta_vec(preproc_module, x.size(0))
+            logits, gates = model(x_raw_n, x_fel_n, theta_vec, source_id, client_id, return_gates=True)
+            gate_stats.append((gates, y.detach().cpu()))
+        else:
+            theta_vec = preproc_theta_vec(preproc_module, x.size(0))
+            logits = model(x_raw_n, x_fel_n, theta_vec, source_id, client_id)
 
         probs = torch.softmax(logits, dim=1)
         loss = F.cross_entropy(logits, y)
@@ -1223,6 +1373,9 @@ def evaluate_full(model, loader, preproc_module):
         "eval_time_s": float(time.time() - t0),
     }
     met.update(_auc_metrics(y_true, p_pred, NUM_CLASSES))
+    if return_gates and gate_stats:
+        gate_metrics = summarize_gate_stats(gate_stats, NUM_CLASSES)
+        met.update(gate_metrics)
     return met, y_true, p_pred
 
 
@@ -1241,14 +1394,18 @@ def train_one_epoch(model, loader, optimizer, preproc_module, criterion, global_
     total = 0
     t0 = time.time()
 
-    for x, y, _ in loader:
+    for x, y, _, source_id, client_id in loader:
         x = x.to(DEVICE, non_blocking=True)
         y = y.to(DEVICE, non_blocking=True)
+        source_id = source_id.to(DEVICE, non_blocking=True)
+        client_id = client_id.to(DEVICE, non_blocking=True)
 
         with torch.amp.autocast(device_type=DEVICE.type, enabled=(scaler is not None)):
             x_p = preproc_module(x)
-            x_n = (x_p - IMAGENET_MEAN) / IMAGENET_STD
-            logits = model(x_n)
+            x_raw_n = (x - IMAGENET_MEAN) / IMAGENET_STD
+            x_fel_n = (x_p - IMAGENET_MEAN) / IMAGENET_STD
+            theta_vec = preproc_theta_vec(preproc_module, x.size(0))
+            logits = model(x_raw_n, x_fel_n, theta_vec, source_id, client_id)
             loss = criterion(logits, y)
             if global_model is not None and CFG["fedprox_mu"] > 0:
                 prox = fedprox_term(model, global_model)
@@ -1319,6 +1476,8 @@ global_model = PVTv2B2_MultiScale(
     num_classes=NUM_CLASSES,
     pretrained=True,
     head_dropout=CFG["head_dropout"],
+    cond_dim=128,
+    num_clients=CFG["clients"],
 ).to(DEVICE)
 
 set_trainable_for_round(global_model, rnd=1)
@@ -1424,6 +1583,8 @@ for rnd in range(1, CFG["rounds"] + 1):
             num_classes=NUM_CLASSES,
             pretrained=False,
             head_dropout=CFG["head_dropout"],
+            cond_dim=128,
+            num_clients=CFG["clients"],
         ).to(DEVICE)
         local_model.load_state_dict(global_model.state_dict(), strict=True)
 
@@ -1453,7 +1614,7 @@ for rnd in range(1, CFG["rounds"] + 1):
             tr_time += t_ep
 
         # Client validation (on val split)
-        met_loc, _, _ = evaluate_full(local_model, val_loader, pre_k)
+        met_loc, _, _ = evaluate_full(local_model, val_loader, pre_k, return_gates=True)
 
         local_models.append(local_model)
         local_weights.append(len(tr_loader.dataset))
@@ -1623,7 +1784,7 @@ def eval_test_per_dataset(ds_name):
         if ds != ds_name:
             continue
         pre = pre_best_ds1 if ds == "ds1" else pre_best_ds2
-        met, y_true, p_pred = evaluate_full(global_model, t_loader, pre)
+    met, y_true, p_pred = evaluate_full(global_model, t_loader, pre, return_gates=True)
         mets.append((met, len(t_loader.dataset), y_true, p_pred))
     agg = weighted_aggregate([(i, m[0], m[1]) for i, m in enumerate(mets)])
     return agg, mets
@@ -1722,7 +1883,7 @@ def run_preproc_validation(frame, preproc, sample_n=600):
 
     xs = []
     for i in range(len(ds)):
-        x, _, _ = ds[i]
+        x, _, _, _, _ = ds[i]
         xs.append(x)
     x = torch.stack(xs).to(DEVICE)
 
@@ -1790,7 +1951,7 @@ def show_before_after(preproc, frame, n=12):
     ds = MRIDataset(sample, indices=list(range(len(sample))), tfms=EVAL_TFMS)
     xs, ys = [], []
     for i in range(len(ds)):
-        x, y, _ = ds[i]
+        x, y, _, _, _ = ds[i]
         xs.append(x)
         ys.append(y)
     x = torch.stack(xs).to(DEVICE)
