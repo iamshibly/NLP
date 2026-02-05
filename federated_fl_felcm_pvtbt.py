@@ -106,15 +106,16 @@ CFG = {
     # Non-IID Dirichlet (within each dataset)
     "dirichlet_alpha": 0.35,
 
-    # GA
-    "use_ga": True,
+    # GA / preprocessing
+    "use_preprocessing": False,
+    "use_ga": False,
     "ga_pop": 10,
     "ga_gens": 5,
     "ga_elites": 3,
     "elite_pool_max": 15,
 
     # augmentation
-    "use_augmentation": True,
+    "use_augmentation": False,
 
     # model adapter/head
     "adapter_dim": 256,
@@ -579,10 +580,10 @@ print_table(dist_df, "Client class distribution (Non-IID, per dataset)")
 add_table_to_csv(dist_df, "client_distribution")
 
 # ============================================================
-# 4) Data pipeline (AUGMENTATION) + ImageNet Norm
+# 4) Data pipeline (NO AUGMENTATION) + ImageNet Norm
 # ============================================================
 print("\n" + "=" * 92)
-print("STEP 4: DATA LOADERS (AUGMENTATION) + IMAGENET NORM")
+print("STEP 4: DATA LOADERS (NO AUGMENTATION) + IMAGENET NORM")
 print("=" * 92)
 
 
@@ -699,7 +700,7 @@ for i, (ds_name, local_id, test_idx) in enumerate(client_test_splits):
     client_test_loaders.append((ds_name, local_id, t_loader))
 
 print(f"Augmentation: {'ON ✅' if CFG['use_augmentation'] else 'OFF ✅ (train transforms == eval transforms)'}")
-print("Note: Before vs After preprocessing images are printed in STEP 13.")
+print(f"Preprocessing: {'ON ✅' if CFG['use_preprocessing'] else 'OFF ✅ (identity)'}")
 
 # Optional visualization: before vs after augmentation (train transforms)
 if CFG["use_augmentation"]:
@@ -742,6 +743,8 @@ if CFG["use_augmentation"]:
 print("\n" + "=" * 92)
 print("STEP 5: GA-TUNED ENHANCED FELCM PREPROCESSOR")
 print("=" * 92)
+if not CFG["use_preprocessing"]:
+    print("Preprocessing disabled → GA/FELCM will be skipped (identity).")
 
 THETA_FULLFORMS = {
     "gamma": "Power transform exponent (γ)",
@@ -1399,7 +1402,7 @@ for rnd in range(1, CFG["rounds"] + 1):
 
         # GA (tuned on tune split)
         ga_t0 = time.time()
-        if CFG["use_ga"]:
+        if CFG["use_preprocessing"] and CFG["use_ga"]:
             best_theta, top_thetas, best_fit = run_ga_for_client(
                 backbone_frozen, tune_loader, elite_pool, use_separability=True
             )
@@ -1520,9 +1523,9 @@ for rnd in range(1, CFG["rounds"] + 1):
     }
 
     # Global theta per dataset (pick from each dataset pool using one val client)
-    if elite_pool_ds1:
+    if CFG["use_preprocessing"] and elite_pool_ds1:
         best_theta_ds1, _ = pick_best_theta_from_pool(global_model, elite_pool_ds1, client_loaders[0][2])
-    if elite_pool_ds2:
+    if CFG["use_preprocessing"] and elite_pool_ds2:
         best_theta_ds2, _ = pick_best_theta_from_pool(global_model, elite_pool_ds2, client_loaders[2][2])
 
     history_local.extend(local_rows)
@@ -1577,8 +1580,16 @@ print("STEP 11: FINAL EVALUATION (FEDERATED VAL + TEST)")
 print("=" * 92)
 
 # Use per-dataset theta
-pre_best_ds1 = theta_to_module(best_theta_ds1).to(DEVICE) if best_theta_ds1 is not None else IDENTITY_PRE
-pre_best_ds2 = theta_to_module(best_theta_ds2).to(DEVICE) if best_theta_ds2 is not None else IDENTITY_PRE
+pre_best_ds1 = (
+    theta_to_module(best_theta_ds1).to(DEVICE)
+    if CFG["use_preprocessing"] and best_theta_ds1 is not None
+    else IDENTITY_PRE
+)
+pre_best_ds2 = (
+    theta_to_module(best_theta_ds2).to(DEVICE)
+    if CFG["use_preprocessing"] and best_theta_ds2 is not None
+    else IDENTITY_PRE
+)
 
 # Federated VAL aggregation (already computed by history, but recompute for paper table)
 val_metrics_clients = []
@@ -1668,6 +1679,8 @@ print(f"- Best θ ds2: {theta_str(best_theta_ds2)}")
 print("\n" + "=" * 92)
 print("STEP 12: PREPROCESSING VALIDATION (VAL SAMPLE)")
 print("=" * 92)
+if not CFG["use_preprocessing"]:
+    print("Preprocessing disabled → skipping validation plots.")
 
 
 @torch.no_grad()
@@ -1743,13 +1756,17 @@ def run_preproc_validation(frame, preproc, sample_n=600):
     return dfm, summary, x, x_after
 
 
-preproc_df, preproc_summary_df, _, _ = run_preproc_validation(
-    val1,
-    pre_best_ds1 if best_theta_ds1 is not None else IDENTITY_PRE,
-    CFG["preproc_val_sample_n"],
-)
-print_table(preproc_summary_df, "Preprocessing validation summary (DS1 VAL sample)")
-add_table_to_csv(preproc_summary_df, "preprocessing_validation_summary_ds1")
+if CFG["use_preprocessing"]:
+    preproc_df, preproc_summary_df, _, _ = run_preproc_validation(
+        val1,
+        pre_best_ds1 if best_theta_ds1 is not None else IDENTITY_PRE,
+        CFG["preproc_val_sample_n"],
+    )
+    print_table(preproc_summary_df, "Preprocessing validation summary (DS1 VAL sample)")
+    add_table_to_csv(preproc_summary_df, "preprocessing_validation_summary_ds1")
+else:
+    preproc_df = pd.DataFrame()
+    preproc_summary_df = pd.DataFrame()
 
 # ============================================================
 # 13) Before vs After preprocessing images (best θ)
@@ -1757,6 +1774,8 @@ add_table_to_csv(preproc_summary_df, "preprocessing_validation_summary_ds1")
 print("\n" + "=" * 92)
 print("STEP 13: BEFORE vs AFTER PREPROCESSING IMAGES (BEST θ) — PRINTED")
 print("=" * 92)
+if not CFG["use_preprocessing"]:
+    print("Preprocessing disabled → skipping before/after preprocessing grid.")
 
 
 @torch.no_grad()
@@ -1796,7 +1815,8 @@ def show_before_after(preproc, frame, n=12):
     plt.show()
 
 
-show_before_after(pre_best_ds1 if best_theta_ds1 is not None else IDENTITY_PRE, test1, n=CFG["before_after_n"])
+if CFG["use_preprocessing"]:
+    show_before_after(pre_best_ds1 if best_theta_ds1 is not None else IDENTITY_PRE, test1, n=CFG["before_after_n"])
 
 # ============================================================
 # 14) ROC + PR curves (TEST, Best θ) — DS1 example
