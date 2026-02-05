@@ -115,7 +115,7 @@ CFG = {
     "elite_pool_max": 15,
 
     # augmentation
-    "use_augmentation": False,
+    "use_augmentation": True,
 
     # model adapter/head
     "adapter_dim": 256,
@@ -580,10 +580,10 @@ print_table(dist_df, "Client class distribution (Non-IID, per dataset)")
 add_table_to_csv(dist_df, "client_distribution")
 
 # ============================================================
-# 4) Data pipeline (NO AUGMENTATION) + ImageNet Norm
+# 4) Data pipeline (AUGMENTATION) + ImageNet Norm
 # ============================================================
 print("\n" + "=" * 92)
-print("STEP 4: DATA LOADERS (NO AUGMENTATION) + IMAGENET NORM")
+print("STEP 4: DATA LOADERS (AUGMENTATION) + IMAGENET NORM")
 print("=" * 92)
 
 
