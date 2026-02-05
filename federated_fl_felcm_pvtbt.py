@@ -699,6 +699,42 @@ for i, (ds_name, local_id, test_idx) in enumerate(client_test_splits):
     client_test_loaders.append((ds_name, local_id, t_loader))
 
 print(f"Augmentation: {'ON ✅' if CFG['use_augmentation'] else 'OFF ✅ (train transforms == eval transforms)'}")
+print("Note: Before vs After preprocessing images are printed in STEP 13.")
+
+# Optional visualization: before vs after augmentation (train transforms)
+if CFG["use_augmentation"]:
+    print("\n" + "-" * 92)
+    print("AUGMENTATION VISUAL CHECK (Before vs After) — TRAIN TRANSFORMS")
+    print("-" * 92)
+    sample_frame = train1 if len(train1) > 0 else train2
+    sample_n = min(8, len(sample_frame))
+    if sample_n > 0:
+        idxs = np.random.choice(len(sample_frame), size=sample_n, replace=False)
+        raw_ds = MRIDataset(sample_frame, indices=idxs.tolist(), tfms=EVAL_TFMS)
+        aug_ds = MRIDataset(sample_frame, indices=idxs.tolist(), tfms=TRAIN_TFMS)
+
+        raws, augs = [], []
+        for i in range(sample_n):
+            x_raw, _, _ = raw_ds[i]
+            x_aug, _, _ = aug_ds[i]
+            raws.append(x_raw)
+            augs.append(x_aug)
+
+        fig = plt.figure(figsize=(min(16, 2.2 * sample_n), 5))
+        for i in range(sample_n):
+            ax1 = plt.subplot(2, sample_n, i + 1)
+            ax1.imshow(raws[i].permute(1, 2, 0).numpy())
+            ax1.set_title("Before Aug", fontsize=8)
+            ax1.axis("off")
+
+            ax2 = plt.subplot(2, sample_n, sample_n + i + 1)
+            ax2.imshow(augs[i].permute(1, 2, 0).numpy())
+            ax2.set_title("After Aug", fontsize=8)
+            ax2.axis("off")
+
+        plt.suptitle("Training Augmentation: Before vs After", fontsize=12, fontweight="bold")
+        plt.tight_layout()
+        plt.show()
 
 # ============================================================
 # 5) Enhanced FELCM + theta fullforms
